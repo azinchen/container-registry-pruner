@@ -157,7 +157,7 @@ echo
 
 # --- GHCR ------------------------------------------------------
 ghcr_find_newest_release_version_id() {
-  local page=1 newest_epoch=-1 newest_id=""
+  local page=1 newest_epoch=-1 newest_id="" newest_tag=""
   while :; do
     local url="https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions?per_page=100&page=${page}"
     local resp
@@ -172,26 +172,27 @@ ghcr_find_newest_release_version_id() {
     [[ "$count" -gt 0 ]] || break
 
     while IFS= read -r row; do
-      local created_at created_epoch vid has_release=0
+      local created_at created_epoch vid has_release=0 tag_found=""
       vid=$(echo "$row" | jq -r '.id')
       created_at=$(echo "$row" | jq -r '.created_at')
       created_epoch=$(iso_to_epoch "$created_at")
 
       if echo "$row" | jq -e '.metadata.container.tags // [] | length > 0' >/dev/null; then
         while IFS= read -r t; do
-          if is_release_tag "$t"; then has_release=1; break; fi
+          if is_release_tag "$t"; then has_release=1; tag_found="$t"; break; fi
         done < <(echo "$row" | jq -r '.metadata.container.tags[]')
       fi
 
       if (( has_release )) && (( created_epoch > newest_epoch )); then
         newest_epoch=$created_epoch
         newest_id="$vid"
+        newest_tag="$tag_found"
       fi
     done < <(echo "$resp" | jq -c '.[]')
     page=$((page+1))
   done
 
-  echo "$newest_id"
+  echo "$newest_id|$newest_tag"
 }
 
 ghcr_cleanup() {
@@ -200,9 +201,14 @@ ghcr_cleanup() {
   fi
 
   echo "==> GHCR: owner_type=$GHCR_OWNER_TYPE owner=$GHCR_OWNER package=$GHCR_PACKAGE"
-  local PROTECTED_NEWEST_GHCR_VERSION_ID
-  PROTECTED_NEWEST_GHCR_VERSION_ID=$(ghcr_find_newest_release_version_id || true)
-  if [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" ]]; then
+  local PROTECTED_NEWEST_GHCR_VERSION_ID PROTECTED_NEWEST_GHCR_VERSION_TAG
+  local _result
+  _result=$(ghcr_find_newest_release_version_id || true)
+  PROTECTED_NEWEST_GHCR_VERSION_ID="${_result%%|*}"
+  PROTECTED_NEWEST_GHCR_VERSION_TAG="${_result#*|}"
+  if [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" && -n "$PROTECTED_NEWEST_GHCR_VERSION_TAG" && "$PROTECTED_NEWEST_GHCR_VERSION_ID" != "$PROTECTED_NEWEST_GHCR_VERSION_TAG" ]]; then
+    echo "GHCR protected newest release-like: tag='$PROTECTED_NEWEST_GHCR_VERSION_TAG' (version_id=$PROTECTED_NEWEST_GHCR_VERSION_ID)"
+  elif [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" ]]; then
     echo "GHCR protected newest release-like version_id: $PROTECTED_NEWEST_GHCR_VERSION_ID"
   else
     echo "GHCR: no release-like versions found to protect."
