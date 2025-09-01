@@ -7,8 +7,11 @@ set -euo pipefail
 # Keeps:
 #   - "latest" and any tags passed via --protect
 #   - Highest release-like tag overall (A.B.C / vA.B.C / A.B.C.D / vA.B.C.D, with optional -suffix)
-#   - (opt) --protect-latest-per-minor: for each A.B, protect ONE tag with highest (C, D, suffix); tie → youngest
-#   - (opt) the youngest N release/dev via --keep-release-count / --keep-dev-count
+#   - (opt) --protect-latest-per <minor|patch>:
+#       minor => for each A.B, protect ONE tag with highest (C, D, suffix); tie → youngest
+#       patch => for each A.B.C, protect ONE tag with highest (D, suffix); tie → youngest
+#       if flag provided without a value -> defaults to patch
+#   - (opt) youngest N release/dev via --keep-release-count / --keep-dev-count
 # Deletes:
 #   - Release tags older than --max-release-days (unless protected/forced-keep)
 #   - Dev tags older than --max-dev-days (unless protected/forced-keep)
@@ -28,7 +31,8 @@ QUIET=0
 VERBOSE=0
 
 # Protection policies
-PROTECT_LATEST_PER_MINOR=0
+PROTECT_LATEST_PER=0         # 0/1
+PROTECT_SCOPE=""             # "minor" or "patch" (default "patch" if PROTECT_LATEST_PER=1 and empty)
 KEEP_RELEASE_COUNT=0
 KEEP_DEV_COUNT=0
 
@@ -106,7 +110,7 @@ Usage:
     [--docker-user USER] [--docker-pass PASS] [--docker-namespace NS] [--docker-repo REPO]
     [--max-release-days N] [--max-dev-days M]
     [--keep-release-count N] [--keep-dev-count M]
-    [--protect-latest-per-minor]
+    [--protect-latest-per <minor|patch>]      # default 'patch' if provided without value
     [--protect TAG]... [--output-dir DIR]
     [--include-untagged] [--max-untagged-days K]   # GHCR only
     [--execute] [--yes] [--delete-limit N]
@@ -129,11 +133,24 @@ while [[ $# -gt 0 ]]; do
     --docker-repo) DOCKER_REPO="$2"; shift 2;;
 
     --max-release-days) MAX_RELEASE_DAYS="$2"; shift 2;;
-    --max-dev-days) MAX_DEV_DAYS="$2"; shift 2;;
+    --max-dev-days)     MAX_DEV_DAYS="$2"; shift 2;;
 
     --keep-release-count) KEEP_RELEASE_COUNT="$2"; shift 2;;
-    --keep-dev-count) KEEP_DEV_COUNT="$2"; shift 2;;
-    --protect-latest-per-minor) PROTECT_LATEST_PER_MINOR=1; shift;;
+    --keep-dev-count)     KEEP_DEV_COUNT="$2"; shift 2;;
+
+    # Configurable protect scope
+    --protect-latest-per)
+      PROTECT_LATEST_PER=1
+      # if value provided and not another flag -> use it; else default to patch
+      if [[ $# -ge 2 && ! "${2:-}" =~ ^-- ]]; then
+        PROTECT_SCOPE="$2"
+        [[ "$PROTECT_SCOPE" =~ ^(minor|patch)$ ]] || die "--protect-latest-per must be 'minor' or 'patch'"
+        shift 2
+      else
+        PROTECT_SCOPE="patch"
+        shift 1
+      fi
+      ;;
 
     --protect) PROTECTED_TAGS+=("$2"); shift 2;;
     --output-dir) OUT_DIR="$2"; shift 2;;
@@ -191,6 +208,11 @@ if (( INCLUDE_UNTAGGED )) && (( DOCKER_ENABLED )); then
   log_info "Docker Hub: --include-untagged has no effect (API doesn't list them)."
 fi
 
+# Default protect scope if feature enabled but unset
+if (( PROTECT_LATEST_PER == 1 )) && [[ -z "$PROTECT_SCOPE" ]]; then
+  PROTECT_SCOPE="patch"
+fi
+
 JQ_PROTECTED=$(printf '%s\n' "${PROTECTED_TAGS[@]}" | jq -R . | jq -cs 'unique')
 
 log_info "Protected tags: ${PROTECTED_TAGS[*]}"
@@ -243,7 +265,7 @@ GHCR_TAGS_CACHE=""
 GHCR_UNTAGGED_CACHE=""
 
 ghcr_cache_versions() {
-  local base_protected_json="$1" max_release="$2" max_dev="$3" protect_minor="$4" keep_release_count="$5" keep_dev_count="$6" include_untagged="$7" max_untagged="$8"
+  local base_protected_json="$1" max_release="$2" max_dev="$3" protect_flag="$4" protect_scope="$5" keep_release_count="$6" keep_dev_count="$7" include_untagged="$8" max_untagged="$9"
 
   local page=1 all_json='[]'
   while :; do
@@ -285,7 +307,8 @@ ghcr_cache_versions() {
       --argjson base_protected "$base_protected_json" \
       --argjson max_release "$max_release" \
       --argjson max_dev "$max_dev" \
-      --argjson protect_minor "$protect_minor" \
+      --argjson protect_flag "$protect_flag" \
+      --arg protect_scope "$protect_scope" \
       --argjson keep_release_count "$keep_release_count" \
       --argjson keep_dev_count "$keep_dev_count" '
       def stripv(t): t|sub("^v";"");
@@ -296,7 +319,7 @@ ghcr_cache_versions() {
         | {name: name, age_days: age,
            maj: ($m.maj|tonumber), min: ($m.min|tonumber),
            c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
-           suf: ($m.suf // ""), key: "\($m.maj).\($m.min)"};
+           suf: ($m.suf // ""), key_minor: "\($m.maj).\($m.min)", key_patch: "\($m.maj).\($m.min).\($m.c)"};
 
       [ .[] | select((.tags|length)>0) | . as $v | ($v.tags[] | {tag: ., age_days: $v.age_days}) ]
       | sort_by(.tag) | group_by(.tag)
@@ -309,12 +332,15 @@ ghcr_cache_versions() {
             ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
         end ) as $highest
 
-      | ( if $protect_minor==1 and ($rel|length)>0 then
-            ( $rel | sort_by(.key) | group_by(.key) | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+      | ( if ($protect_flag==1 and ($rel|length)>0) then
+            ( $rel
+              | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
+              | sort_by(.group) | group_by(.group)
+              | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
           else [] end
-        ) as $minor_heads
+        ) as $scope_heads
 
-      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $minor_heads | unique ) as $protected
+      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
 
       | ( $tags | map(select(.type=="release" and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.tag) ) as $force_keep_release
       | ( $tags | map(select(.type=="dev"     and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.tag) ) as $force_keep_dev
@@ -399,7 +425,7 @@ ghcr_cleanup() {
   (( GHCR_ENABLED )) || { log_info "==> GHCR: skipping (missing settings)"; echo; return 0; }
   log_info "==> GHCR: owner_type=$GHCR_OWNER_TYPE owner=$GHCR_OWNER package=$GHCR_PACKAGE"
 
-  if ! ghcr_cache_versions "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER_MINOR" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "$INCLUDE_UNTAGGED" "${MAX_UNTAGGED_DAYS:-0}"; then
+  if ! ghcr_cache_versions "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "$INCLUDE_UNTAGGED" "${MAX_UNTAGGED_DAYS:-0}"; then
     log_error "GHCR: caching failed; continuing with empty sets"
     GHCR_TAGS_CACHE='[]'; GHCR_UNTAGGED_CACHE='[]'
   fi
@@ -478,7 +504,7 @@ docker_login() {
 }
 
 docker_cache_tags() {
-  local token="$1" base_protected_json="$2" max_release="$3" max_dev="$4" protect_minor="$5" keep_release_count="$6" keep_dev_count="$7"
+  local token="$1" base_protected_json="$2" max_release="$3" max_dev="$4" protect_flag="$5" protect_scope="$6" keep_release_count="$7" keep_dev_count="$8"
 
   local url="https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags?page_size=100&ordering=last_updated"
   local all_json='[]'
@@ -504,7 +530,8 @@ docker_cache_tags() {
       --argjson base_protected "$base_protected_json" \
       --argjson max_release "$max_release" \
       --argjson max_dev "$max_dev" \
-      --argjson protect_minor "$protect_minor" \
+      --argjson protect_flag "$protect_flag" \
+      --arg protect_scope "$protect_scope" \
       --argjson keep_release_count "$keep_release_count" \
       --argjson keep_dev_count "$keep_dev_count" '
       def stripv(t): t|sub("^v";"");
@@ -515,7 +542,7 @@ docker_cache_tags() {
         | {name: name, age_days: age,
            maj: ($m.maj|tonumber), min: ($m.min|tonumber),
            c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
-           suf: ($m.suf // ""), key: "\($m.maj).\($m.min)"};
+           suf: ($m.suf // ""), key_minor: "\($m.maj).\($m.min)", key_patch: "\($m.maj).\($m.min).\($m.c)"};
 
       [ .[] |
         { name: .name,
@@ -531,12 +558,15 @@ docker_cache_tags() {
             ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
         end ) as $highest
 
-      | ( if $protect_minor==1 and ($rel|length)>0 then
-            ( $rel | sort_by(.key) | group_by(.key) | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+      | ( if ($protect_flag==1 and ($rel|length)>0) then
+            ( $rel
+              | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
+              | sort_by(.group) | group_by(.group)
+              | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
           else [] end
-        ) as $minor_heads
+        ) as $scope_heads
 
-      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $minor_heads | unique ) as $protected
+      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
 
       | ( $tags | map(select(.type=="release" and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.name) ) as $force_keep_release
       | ( $tags | map(select(.type=="dev"     and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.name) ) as $force_keep_dev
@@ -589,7 +619,7 @@ docker_login_wrap_and_cache() {
     DOCKER_TAGS_CACHE='[]'
   else
     DOCKER_JWT="$token"
-    docker_cache_tags "$token" "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER_MINOR" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" || {
+    docker_cache_tags "$token" "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" || {
       log_error "Docker Hub: caching failed; continuing with empty set"
       DOCKER_TAGS_CACHE='[]'
     }
