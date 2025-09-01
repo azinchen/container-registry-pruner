@@ -5,29 +5,41 @@ set -euo pipefail
 # Container cleanup for GHCR + Docker Hub (each optional)
 # ------------------------------------------------------------
 # Keeps:
-#   - tag: latest
-#   - the NEWEST release-like version (x.y.z or x.y.z-<anything>)
+#   - "latest" and any tags passed via --protect
+#   - Highest release-like tag overall (A.B.C / vA.B.C / A.B.C.D / vA.B.C.D, with optional -suffix)
+#   - (opt) --protect-latest-per-minor: for each A.B, protect ONE tag with highest (C, D, suffix); tie → youngest
+#   - (opt) the youngest N release/dev via --keep-release-count / --keep-dev-count
 # Deletes:
-#   - Release tags older than --max-release-days
-#   - Dev tags older than --max-dev-days
+#   - Release tags older than --max-release-days (unless protected/forced-keep)
+#   - Dev tags older than --max-dev-days (unless protected/forced-keep)
+#   - (opt, GHCR) untagged versions older than --max-untagged-days when --include-untagged
 #
-# Runs only on registries with complete settings provided.
-# DRY RUN by default; add --execute to perform deletions.
-#
-# Dependencies: curl, jq, GNU date (or gdate on macOS)
-# GHCR auth: GitHub PAT with read:packages, delete:packages
-# Docker Hub auth: username/password (JWT)
+# DRY RUN by default; add --execute (and optionally --yes) to perform deletions.
 # ------------------------------------------------------------
 
-PROTECTED_TAGS=("latest")  # dynamic newest release is determined at runtime
+PROTECTED_TAGS=("latest")
 
-# Defaults
+# Modes & knobs
 DRY_RUN=1
+ASSUME_YES=0
+DELETE_LIMIT=0
+OUT_DIR=""
+QUIET=0
+VERBOSE=0
+
+# Protection policies
+PROTECT_LATEST_PER_MINOR=0
+KEEP_RELEASE_COUNT=0
+KEEP_DEV_COUNT=0
+
+# Untagged handling (GHCR only)
+INCLUDE_UNTAGGED=0
+MAX_UNTAGGED_DAYS=""
 
 # --- GHCR (optional) -----------------------------------------
 GHCR_OWNER_TYPE="users"    # "users" or "orgs"
 GHCR_OWNER=""
-GHCR_USER=""               # optional; not used for auth, kept for symmetry
+GHCR_USER=""
 GHCR_TOKEN=""
 GHCR_PACKAGE=""
 
@@ -36,69 +48,69 @@ DOCKER_USER=""
 DOCKER_PASS=""
 DOCKER_NAMESPACE=""
 DOCKER_REPO=""
+DOCKER_JWT=""
 
-# --- thresholds (required only if at least one registry is enabled)
+# --- thresholds ----------------------------------------------
 MAX_RELEASE_DAYS=""
 MAX_DEV_DAYS=""
 
 # --- utilities ------------------------------------------------
 die() { echo "Error: $*" >&2; exit 1; }
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+log_info()   { (( QUIET )) || echo "$@"; }
+log_debug()  { (( VERBOSE )) && echo "[debug] $@"; }
+log_error()  { echo "$@" >&2; }
 
-# Pick a GNU-compatible date (needs -d)
 DATE_BIN="date"
 if ! date -u -d "1970-01-01T00:00:00Z" +%s >/dev/null 2>&1; then
-  if have_cmd gdate; then
-    DATE_BIN="gdate"
-  else
-    die "GNU date required (install coreutils for 'gdate' on macOS)."
-  fi
+  if have_cmd gdate; then DATE_BIN="gdate"; else die "GNU date required (install coreutils for 'gdate' on macOS)."; fi
 fi
 iso_to_epoch() { $DATE_BIN -u -d "$1" +%s; }
 now_epoch()    { $DATE_BIN -u +%s; }
 
-contains_protected() {
-  local t="$1"
-  for p in "${PROTECTED_TAGS[@]}"; do
-    [[ "$t" == "$p" ]] && return 0
+curl_retry_json() {
+  local max=5 delay=1 out rc
+  while :; do
+    if out=$(curl -fsS "$@"); then printf '%s' "$out"; return 0; fi
+    rc=$?; ((max--)) || return "$rc"; sleep "$delay"; delay=$((delay*2))
+  done
+}
+
+curl_delete_with_retry() {
+  local url="$1"; shift
+  local tries=5 delay=1 status
+  while :; do
+    status=$(curl -sS -o /dev/null -w '%{http_code}' -X DELETE "$@" "$url")
+    if [[ "$status" =~ ^2 ]]; then return 0; fi
+    if [[ "$status" == "429" || "$status" =~ ^5 ]]; then
+      ((tries--)) || break; sleep "$delay"; delay=$((delay*2)); continue
+    fi
+    break
   done
   return 1
 }
 
-# Release: x.y.z or x.y.z-<anything> (letters/digits/dot/hyphen)
-is_release_tag() {
-  local t="$1"
-  [[ "$t" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9][A-Za-z0-9\.-]*)?$ ]]
+confirm_execute_once() {
+  local pending_delete_count="$1"
+  if (( DRY_RUN )) || (( ASSUME_YES )); then return 0; fi
+  if [[ ! -t 0 ]]; then return 0; fi
+  read -r -p "About to DELETE ${pending_delete_count} item(s). Continue? [y/N] " ans
+  [[ "$ans" =~ ^[Yy]$ ]] || die "Aborted."
 }
 
 usage() {
   cat <<EOF
 Usage:
   $(basename "$0")
-    [--ghcr-owner-type users|orgs]
-    [--ghcr-owner OWNER]
-    [--ghcr-user USER] [--ghcr-token TOKEN] [--ghcr-package PACKAGE]
+    [--ghcr-owner-type users|orgs] [--ghcr-owner OWNER] [--ghcr-user USER] [--ghcr-token TOKEN] [--ghcr-package PACKAGE]
     [--docker-user USER] [--docker-pass PASS] [--docker-namespace NS] [--docker-repo REPO]
     [--max-release-days N] [--max-dev-days M]
-    [--execute] [--protect extraTag]...
-
-Notes:
-  * You can configure GHCR, Docker Hub, or both. Missing configs => that registry is skipped.
-  * If at least one registry is configured, --max-release-days and --max-dev-days are required.
-  * Always keeps "latest" and the newest release-like version. Add more with --protect.
-
-Examples:
-  # GHCR only (dry-run)
-  $(basename "$0") \\
-    --ghcr-owner-type users --ghcr-owner ghuser \\
-    --ghcr-token ghp_xxx --ghcr-package myimage \\
-    --max-release-days 90 --max-dev-days 14
-
-  # Docker Hub only (execute)
-  $(basename "$0") \\
-    --docker-user dhuser --docker-pass 'secret' \\
-    --docker-namespace team --docker-repo myimage \\
-    --max-release-days 90 --max-dev-days 14 --execute
+    [--keep-release-count N] [--keep-dev-count M]
+    [--protect-latest-per-minor]
+    [--protect TAG]... [--output-dir DIR]
+    [--include-untagged] [--max-untagged-days K]   # GHCR only
+    [--execute] [--yes] [--delete-limit N]
+    [--quiet] [--verbose]
 EOF
 }
 
@@ -119,8 +131,23 @@ while [[ $# -gt 0 ]]; do
     --max-release-days) MAX_RELEASE_DAYS="$2"; shift 2;;
     --max-dev-days) MAX_DEV_DAYS="$2"; shift 2;;
 
+    --keep-release-count) KEEP_RELEASE_COUNT="$2"; shift 2;;
+    --keep-dev-count) KEEP_DEV_COUNT="$2"; shift 2;;
+    --protect-latest-per-minor) PROTECT_LATEST_PER_MINOR=1; shift;;
+
     --protect) PROTECTED_TAGS+=("$2"); shift 2;;
+    --output-dir) OUT_DIR="$2"; shift 2;;
+
+    --include-untagged) INCLUDE_UNTAGGED=1; shift;;
+    --max-untagged-days) MAX_UNTAGGED_DAYS="$2"; shift 2;;
+
     --execute) DRY_RUN=0; shift;;
+    --yes) ASSUME_YES=1; shift;;
+    --delete-limit) DELETE_LIMIT="$2"; shift 2;;
+
+    --quiet) QUIET=1; shift;;
+    --verbose) VERBOSE=1; shift;;
+
     -h|--help) usage; exit 0;;
     *) die "Unknown option: $1 (see --help)";;
   esac
@@ -129,266 +156,477 @@ done
 have_cmd curl || die "curl is required"
 have_cmd jq   || die "jq is required"
 
-# Determine which registries are enabled (complete config only)
+# Validate switches
+[[ "$GHCR_OWNER_TYPE" =~ ^(users|orgs)$ ]] || { [[ -z "$GHCR_OWNER" ]] || die "--ghcr-owner-type must be 'users' or 'orgs'"; }
+[[ -z "$MAX_RELEASE_DAYS"   || "$MAX_RELEASE_DAYS"   =~ ^[0-9]+$ ]] || die "--max-release-days must be an integer"
+[[ -z "$MAX_DEV_DAYS"       || "$MAX_DEV_DAYS"       =~ ^[0-9]+$ ]] || die "--max-dev-days must be an integer"
+[[ -z "$MAX_UNTAGGED_DAYS"  || "$MAX_UNTAGGED_DAYS"  =~ ^[0-9]+$ ]] || die "--max-untagged-days must be an integer"
+[[ "$KEEP_RELEASE_COUNT" =~ ^[0-9]+$ ]] || die "--keep-release-count must be an integer"
+[[ "$KEEP_DEV_COUNT"     =~ ^[0-9]+$ ]] || die "--keep-dev-count must be an integer"
+[[ "$DELETE_LIMIT"       =~ ^[0-9]+$ ]] || die "--delete-limit must be an integer"
+
+# Determine which registries are enabled
 GHCR_ENABLED=0
 if [[ -n "$GHCR_OWNER" && -n "$GHCR_TOKEN" && -n "$GHCR_PACKAGE" && ( "$GHCR_OWNER_TYPE" == "users" || "$GHCR_OWNER_TYPE" == "orgs" ) ]]; then
   GHCR_ENABLED=1
 fi
-
 DOCKER_ENABLED=0
 if [[ -n "$DOCKER_USER" && -n "$DOCKER_PASS" && -n "$DOCKER_NAMESPACE" && -n "$DOCKER_REPO" ]]; then
   DOCKER_ENABLED=1
 fi
 
 if (( GHCR_ENABLED == 0 && DOCKER_ENABLED == 0 )); then
-  echo "No registry settings provided. Nothing to do."
+  log_info "No registry settings provided. Nothing to do."
   exit 0
 fi
 
-# Thresholds required only if something will run
+# Thresholds required when something will run
 if [[ -z "$MAX_RELEASE_DAYS" || -z "$MAX_DEV_DAYS" ]]; then
   die "--max-release-days and --max-dev-days are required when a registry is configured"
 fi
+if (( INCLUDE_UNTAGGED )) && (( GHCR_ENABLED )); then
+  [[ -n "$MAX_UNTAGGED_DAYS" ]] || die "--max-untagged-days is required when --include-untagged is used for GHCR"
+fi
+if (( INCLUDE_UNTAGGED )) && (( DOCKER_ENABLED )); then
+  log_info "Docker Hub: --include-untagged has no effect (API doesn't list them)."
+fi
 
-echo "Protected tags: ${PROTECTED_TAGS[*]}"
-echo "Mode: $([[ $DRY_RUN -eq 1 ]] && echo DRY RUN || echo EXECUTE)"
-echo "Enabled: GHCR=$GHCR_ENABLED, DockerHub=$DOCKER_ENABLED"
+JQ_PROTECTED=$(printf '%s\n' "${PROTECTED_TAGS[@]}" | jq -R . | jq -cs 'unique')
+
+log_info "Protected tags: ${PROTECTED_TAGS[*]}"
+log_info "Mode: $([[ $DRY_RUN -eq 1 ]] && echo DRY RUN || echo EXECUTE)"
+log_info "Enabled: GHCR=$GHCR_ENABLED, DockerHub=$DOCKER_ENABLED"
 echo
 
-# --- GHCR ------------------------------------------------------
-ghcr_find_newest_release_version_id() {
-  local page=1 newest_epoch=-1 newest_id="" newest_tag=""
-  while :; do
-    local url="https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions?per_page=100&page=${page}"
-    local resp
-    if ! resp=$(curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer ${GHCR_TOKEN}" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$url"); then
-      break
-    fi
-    local count; count=$(echo "$resp" | jq 'length')
-    [[ "$count" -gt 0 ]] || break
+# Release recognition regex (8 patterns)
+RELEASE_RE='^v?[0-9]+\.[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:-[A-Za-z0-9][A-Za-z0-9\.-]*)?$'
 
-    while IFS= read -r row; do
-      local created_at created_epoch vid has_release=0 tag_found=""
-      vid=$(echo "$row" | jq -r '.id')
-      created_at=$(echo "$row" | jq -r '.created_at')
-      created_epoch=$(iso_to_epoch "$created_at")
+ANY_DELETE_FAILED=0
+trap 'ret=$?; if (( ANY_DELETE_FAILED != 0 )); then exit 1; else exit $ret; fi' EXIT
 
-      if echo "$row" | jq -e '.metadata.container.tags // [] | length > 0' >/dev/null; then
-        while IFS= read -r t; do
-          if is_release_tag "$t"; then has_release=1; tag_found="$t"; break; fi
-        done < <(echo "$row" | jq -r '.metadata.container.tags[]')
-      fi
-
-      if (( has_release )) && (( created_epoch > newest_epoch )); then
-        newest_epoch=$created_epoch
-        newest_id="$vid"
-        newest_tag="$tag_found"
-      fi
-    done < <(echo "$resp" | jq -c '.[]')
-    page=$((page+1))
-  done
-
-  echo "$newest_id|$newest_tag"
-}
-
-ghcr_cleanup() {
-  if (( GHCR_ENABLED == 0 )); then
-    echo "==> GHCR: skipping (missing settings)"; echo; return
-  fi
-
-  echo "==> GHCR: owner_type=$GHCR_OWNER_TYPE owner=$GHCR_OWNER package=$GHCR_PACKAGE"
-  local PROTECTED_NEWEST_GHCR_VERSION_ID PROTECTED_NEWEST_GHCR_VERSION_TAG
-  local _result
-  _result=$(ghcr_find_newest_release_version_id || true)
-  PROTECTED_NEWEST_GHCR_VERSION_ID="${_result%%|*}"
-  PROTECTED_NEWEST_GHCR_VERSION_TAG="${_result#*|}"
-  if [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" && -n "$PROTECTED_NEWEST_GHCR_VERSION_TAG" && "$PROTECTED_NEWEST_GHCR_VERSION_ID" != "$PROTECTED_NEWEST_GHCR_VERSION_TAG" ]]; then
-    echo "GHCR protected newest release-like: tag='$PROTECTED_NEWEST_GHCR_VERSION_TAG' (version_id=$PROTECTED_NEWEST_GHCR_VERSION_ID)"
-  elif [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" ]]; then
-    echo "GHCR protected newest release-like version_id: $PROTECTED_NEWEST_GHCR_VERSION_ID"
-  else
-    echo "GHCR: no release-like versions found to protect."
-  fi
-
-  local page=1 now; now=$(now_epoch)
-  local deleted=0 considered=0 kept=0
-
-  while :; do
-    local url="https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions?per_page=100&page=${page}"
-    local resp
-    resp=$(curl -fsSL \
-      -H "Accept: application/vnd.github+json" \
-      -H "Authorization: Bearer ${GHCR_TOKEN}" \
-      -H "X-GitHub-Api-Version: 2022-11-28" \
-      "$url") || break
-
-    local count; count=$(echo "$resp" | jq 'length')
-    [[ "$count" -gt 0 ]] || break
-
-    for row in $(echo "$resp" | jq -cr '.[] | @base64'); do
-      _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
-      local version_id created_at created_epoch age_days
-      version_id=$(_jq '.id')
-      created_at=$(_jq '.created_at')
-      created_epoch=$(iso_to_epoch "$created_at")
-      age_days=$(( (now - created_epoch) / 86400 ))
-
-      local tags_json; tags_json=$(_jq '.metadata.container.tags // []')
-      readarray -t tags < <(echo "$tags_json" | jq -r '.[]')
-
-      if [[ -n "$PROTECTED_NEWEST_GHCR_VERSION_ID" && "$version_id" == "$PROTECTED_NEWEST_GHCR_VERSION_ID" ]]; then
-        kept=$((kept+1))
-        echo "GHCR keep (newest release-like version): version_id=$version_id tags=[${tags[*]}] age=${age_days}d"
-        continue
-      fi
-
-      local has_protected=0
-      for t in "${tags[@]}"; do
-        if contains_protected "$t"; then has_protected=1; break; fi
-      done
-      if (( has_protected )); then
-        kept=$((kept+1))
-        echo "GHCR keep (protected tag): version_id=$version_id tags=[${tags[*]}] age=${age_days}d"
-        continue
-      fi
-
-      local is_release=0
-      for t in "${tags[@]}"; do
-        if is_release_tag "$t"; then is_release=1; break; fi
-      done
-      local threshold=$([[ $is_release -eq 1 ]] && echo "$MAX_RELEASE_DAYS" || echo "$MAX_DEV_DAYS")
-
-      considered=$((considered+1))
-      if (( age_days > threshold )); then
-        if (( DRY_RUN )); then
-          echo "GHCR would DELETE: version_id=$version_id tags=[${tags[*]}] age=${age_days}d (> ${threshold}d, $([[ $is_release -eq 1 ]] && echo release || echo dev))"
-        else
-          echo "GHCR DELETE: version_id=$version_id tags=[${tags[*]}] age=${age_days}d (> ${threshold}d, $([[ $is_release -eq 1 ]] && echo release || echo dev))"
-          curl -fsSL -X DELETE \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${GHCR_TOKEN}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions/${version_id}" >/dev/null
-          deleted=$((deleted+1))
-        fi
-      else
-        kept=$((kept+1))
-        echo "GHCR keep: version_id=$version_id tags=[${tags[*]}] age=${age_days}d (<= ${threshold}d)"
-      fi
-    done
-
-    page=$((page+1))
-  done
-
-  echo "GHCR summary: considered=$considered kept=$kept deleted=$deleted (final deletions only with --execute)"
+# ---------- printers ----------
+print_tag_rows() {
+  local json="$1"
+  printf "%-8s %-10s %8s   %s\n" ACTION TYPE AGE TAG
+  echo "----------------------------------------------------------"
+  local had=0 act
+  while IFS=$'\t' read -r action type age tag; do
+    [[ -z "${action:-}" ]] && continue
+    had=1
+    if [[ "$action" == "keep" ]]; then act="KEEP"; else if (( DRY_RUN )); then act="DRY-RUN"; else act="DELETE"; fi; fi
+    printf "%-8s %-10s %8s   %s\n" "$act" "$type" "$age" "$tag"
+  done < <(jq -r '.[] | [.action, .type_out, ("\(.age_days)d"), ( .tag // .name // "" )] | @tsv' <<< "$json" || true)
+  (( had )) || echo "(none)"
   echo
 }
 
-# --- Docker Hub ------------------------------------------------
-docker_login() {
-  curl -fsSL -H "Content-Type: application/json" \
-    -X POST https://hub.docker.com/v2/users/login \
-    -d "{\"username\":\"${DOCKER_USER}\",\"password\":\"${DOCKER_PASS}\"}" | jq -r '.token'
+print_untagged_rows() {
+  local json="$1"
+  printf "%-8s %-10s %8s   %s\n" ACTION TYPE AGE VERSION_ID
+  echo "----------------------------------------------------------"
+  local had=0 act
+  while IFS=$'\t' read -r action type age vid; do
+    [[ -z "${action:-}" ]] && continue
+    had=1
+    if [[ "$action" == "keep" ]]; then act="KEEP"; else if (( DRY_RUN )); then act="DRY-RUN"; else act="DELETE"; fi; fi
+    printf "%-8s %-10s %8s   %s\n" "$act" "$type" "$age" "$vid"
+  done < <(jq -r '.[] | [.action, .type_out, ("\(.age_days)d"), (.id|tostring)] | @tsv' <<< "$json" || true)
+  (( had )) || echo "(none)"
+  echo
 }
 
-docker_find_newest_release_tag() {
-  local token="$1" url newest_epoch=-1 newest_tag=""
-  url="https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags?page_size=100&ordering=last_updated"
+# ==============================================================
+# GHCR
+# ==============================================================
+GHCR_VERSIONS_CACHE=""
+GHCR_TAGS_CACHE=""
+GHCR_UNTAGGED_CACHE=""
+
+ghcr_cache_versions() {
+  local base_protected_json="$1" max_release="$2" max_dev="$3" protect_minor="$4" keep_release_count="$5" keep_dev_count="$6" include_untagged="$7" max_untagged="$8"
+
+  local page=1 all_json='[]'
+  while :; do
+    local url="https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions?per_page=100&page=${page}"
+    local resp
+    if ! resp=$(curl_retry_json -H "Accept: application/vnd.github+json" \
+                                -H "Authorization: Bearer ${GHCR_TOKEN}" \
+                                -H "X-GitHub-Api-Version: 2022-11-28" \
+                                "$url"); then
+      log_error "GHCR: fetch failed (page=$page)"; break
+    fi
+    local count; count=$(echo "$resp" | jq 'length')
+    [[ "$count" -gt 0 ]] || break
+    all_json=$(jq -s 'add' <(echo "$all_json") <(echo "$resp"))
+    page=$((page+1))
+  done
+  log_debug "GHCR fetched versions: $(echo "$all_json" | jq 'length')"
+  local now; now=$(now_epoch)
+
+  local _tmp
+  if ! _tmp=$(
+    jq -c --argjson now "$now" --arg re "$RELEASE_RE" --argjson incl "$include_untagged" '
+      [ .[] | {id: .id, created_at: .created_at, tags: (.metadata.container.tags // [])} ]
+      | (if $incl==1 then . else map(select(.tags | length > 0)) end)
+      | map(.age_days = (( $now - (.created_at | fromdateiso8601) ) / 86400 | floor))
+      | map(.type = (if (.tags|length)==0 then "untagged"
+                     else if (.tags | map(test($re)) | any) then "release" else "dev" end end))
+    ' <<< "$all_json"
+  ); then
+    log_error "GHCR: failed to process versions JSON"
+    GHCR_VERSIONS_CACHE='[]'
+  else
+    GHCR_VERSIONS_CACHE="$_tmp"
+  fi
+
+  if ! _tmp=$(
+    jq -c \
+      --arg re "$RELEASE_RE" \
+      --argjson base_protected "$base_protected_json" \
+      --argjson max_release "$max_release" \
+      --argjson max_dev "$max_dev" \
+      --argjson protect_minor "$protect_minor" \
+      --argjson keep_release_count "$keep_release_count" \
+      --argjson keep_dev_count "$keep_dev_count" '
+      def stripv(t): t|sub("^v";"");
+      def parse(t):
+        (stripv(t) | capture("^(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<c>[0-9]+)(?:\\.(?<d>[0-9]+))?(?:-(?<suf>[A-Za-z0-9][A-Za-z0-9\\.-]*))?$"));
+      def rel_obj(name; age):
+        (parse(name) // empty) as $m
+        | {name: name, age_days: age,
+           maj: ($m.maj|tonumber), min: ($m.min|tonumber),
+           c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
+           suf: ($m.suf // ""), key: "\($m.maj).\($m.min)"};
+
+      [ .[] | select((.tags|length)>0) | . as $v | ($v.tags[] | {tag: ., age_days: $v.age_days}) ]
+      | sort_by(.tag) | group_by(.tag)
+      | map({ tag: (.[0].tag), age_days: (map(.age_days) | min),
+              type: (if (.[0].tag | test($re)) then "release" else "dev" end) }) as $tags
+
+      | ( $tags | map(select(.type=="release") | rel_obj(.tag; .age_days)) ) as $rel
+
+      | ( if ($rel|length)==0 then "" else
+            ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
+        end ) as $highest
+
+      | ( if $protect_minor==1 and ($rel|length)>0 then
+            ( $rel | sort_by(.key) | group_by(.key) | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+          else [] end
+        ) as $minor_heads
+
+      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $minor_heads | unique ) as $protected
+
+      | ( $tags | map(select(.type=="release" and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.tag) ) as $force_keep_release
+      | ( $tags | map(select(.type=="dev"     and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.tag) ) as $force_keep_dev
+
+      | $tags
+      | map(
+          .is_protected = ((.tag as $t | $protected | index($t)) != null)
+        | .forced_keep  = ((.tag as $t | ( ($force_keep_release + $force_keep_dev) // [] ) | index($t)) != null)
+        | .action = (if (.is_protected or .forced_keep) then "keep"
+                     elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
+                     elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
+                     else "keep" end)
+        | .type_out = (if .is_protected then "protected" else .type end)
+        | .order_bucket =
+            (if .is_protected and .tag=="latest" then 0
+             elif .is_protected and (.tag | test($re)) then 1
+             elif .is_protected then 2
+             elif .type=="release" and .action=="keep" then 3
+             elif .type=="release" and .action=="delete" then 4
+             elif .type=="dev" and .action=="keep" then 5
+             else 6 end)
+        | .sort_key =
+            (if .order_bucket==1 then
+               ( (parse(.tag)) as $p
+                 | [($p.maj|tonumber),($p.min|tonumber),($p.c|tonumber),((($p.d // -1)|tonumber)),($p.suf // ""), (0 - .age_days)] )
+             elif .order_bucket==2 then [ .tag ]
+             else [ .age_days ] end)
+        )
+      | sort_by([.order_bucket, .sort_key])
+      | map({action, type_out, age_days, tag})
+    ' <<< "$GHCR_VERSIONS_CACHE"
+  ); then
+    log_error "GHCR: failed to reduce to per-tag set"
+    GHCR_TAGS_CACHE='[]'
+  else
+    GHCR_TAGS_CACHE="$_tmp"
+  fi
+
+  if (( include_untagged )); then
+    if ! _tmp=$(
+      jq -c --argjson maxu "$max_untagged" '
+        [ .[] | select((.tags|length)==0) |
+          . + { is_protected:false, forced_keep:false,
+                action: (if .age_days <= $maxu then "keep" else "delete" end),
+                type_out:"untagged" } ]
+      ' <<< "$GHCR_VERSIONS_CACHE"
+    ); then
+      log_error "GHCR: failed to select untagged"
+      GHCR_UNTAGGED_CACHE='[]'
+    else
+      GHCR_UNTAGGED_CACHE="$_tmp"
+    fi
+  else
+    GHCR_UNTAGGED_CACHE='[]'
+  fi
+
+  if [[ -n "$OUT_DIR" ]]; then
+    mkdir -p "$OUT_DIR"
+    printf '%s\n' "${GHCR_VERSIONS_CACHE:-[]}" | jq -S '.' > "$OUT_DIR/ghcr_versions_cache.json" || true
+    printf '%s\n' "${GHCR_TAGS_CACHE:-[]}"     | jq -S '.' > "$OUT_DIR/ghcr_tags_cache.json"     || true
+    jq -r '.[] | [.action,.type_out,("\(.age_days)d"),.tag] | @tsv' <<< "${GHCR_TAGS_CACHE:-[]}" > "$OUT_DIR/ghcr_plan.tsv" || true
+    printf '%s\n' "${GHCR_UNTAGGED_CACHE:-[]}" | jq -S '.' > "$OUT_DIR/ghcr_untagged_cache.json" || true
+    jq -r '.[] | [.action,.type_out,("\(.age_days)d"),(.id|tostring)] | @tsv' <<< "${GHCR_UNTAGGED_CACHE:-[]}" > "$OUT_DIR/ghcr_untagged_plan.tsv" || true
+  fi
+
+  local highest
+  highest=$(jq -r '
+    def stripv(t): t|sub("^v";"");
+    def parse(t):
+      (stripv(t) | capture("^(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<c>[0-9]+)(?:\\.(?<d>[0-9]+))?(?:-(?<suf>[A-Za-z0-9][A-Za-z0-9\\.-]*))?$"));
+    [ .[] | select(.type_out=="protected" or .type_out=="release") | .tag ] | unique
+    | if length==0 then "" else
+        sort_by( (parse(.) | [(.maj|tonumber),(.min|tonumber),(.c|tonumber),((.d // -1)|tonumber),((.suf // "")),(0)]) ) | last
+      end
+  ' <<< "${GHCR_TAGS_CACHE:-[]}")
+  if [[ -n "$highest" ]]; then log_info "GHCR protected highest release-like tag: ${highest}"; else log_info "GHCR: no release-like tags found to protect."; fi
+
+  return 0
+}
+
+ghcr_cleanup() {
+  (( GHCR_ENABLED )) || { log_info "==> GHCR: skipping (missing settings)"; echo; return 0; }
+  log_info "==> GHCR: owner_type=$GHCR_OWNER_TYPE owner=$GHCR_OWNER package=$GHCR_PACKAGE"
+
+  if ! ghcr_cache_versions "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER_MINOR" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "$INCLUDE_UNTAGGED" "${MAX_UNTAGGED_DAYS:-0}"; then
+    log_error "GHCR: caching failed; continuing with empty sets"
+    GHCR_TAGS_CACHE='[]'; GHCR_UNTAGGED_CACHE='[]'
+  fi
+
+  print_tag_rows "$GHCR_TAGS_CACHE"
+  if (( INCLUDE_UNTAGGED )); then print_untagged_rows "$GHCR_UNTAGGED_CACHE"; fi
+
+  local pending; pending=$(jq '[ .[] | select(.action=="delete") ] | length' <<< "${GHCR_TAGS_CACHE:-[]}")
+  local pending_u; pending_u=$(jq '[ .[] | select(.action=="delete") ] | length' <<< "${GHCR_UNTAGGED_CACHE:-[]}")
+  local total=$(( pending + pending_u ))
+
+  if (( total > 0 && DRY_RUN == 0 )); then
+    confirm_execute_once "$total"
+    local remaining="$DELETE_LIMIT"
+
+    while IFS= read -r tag; do
+      [[ -z "${tag:-}" ]] && continue
+      while IFS= read -r vid; do
+        if (( DELETE_LIMIT>0 && remaining==0 )); then break; fi
+        if curl_delete_with_retry "https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions/${vid}" \
+             -H "Accept: application/vnd.github+json" \
+             -H "Authorization: Bearer ${GHCR_TOKEN}" \
+             -H "X-GitHub-Api-Version: 2022-11-28"
+        then (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
+        else log_error "  failed to delete GHCR version_id=$vid (tag=$tag)"; ANY_DELETE_FAILED=1; fi
+      done < <(jq -r --arg t "$tag" '.[] | select(any(.tags[]?; . == $t)) | .id' <<< "${GHCR_VERSIONS_CACHE:-[]}" || true)
+    done < <(jq -r '.[] | select(.action=="delete") | .tag' <<< "${GHCR_TAGS_CACHE:-[]}" || true)
+
+    if (( INCLUDE_UNTAGGED )); then
+      while IFS= read -r vid; do
+        if (( DELETE_LIMIT>0 && remaining==0 )); then break; fi
+        if curl_delete_with_retry "https://api.github.com/${GHCR_OWNER_TYPE}/${GHCR_OWNER}/packages/container/${GHCR_PACKAGE}/versions/${vid}" \
+             -H "Accept: application/vnd.github+json" \
+             -H "Authorization: Bearer ${GHCR_TOKEN}" \
+             -H "X-GitHub-Api-Version: 2022-11-28"
+        then (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
+        else log_error "  failed to delete GHCR untagged version_id=$vid"; ANY_DELETE_FAILED=1; fi
+      done < <(jq -r '.[] | select(.action=="delete") | .id' <<< "${GHCR_UNTAGGED_CACHE:-[]}" || true)
+    fi
+  fi
+
+  local kept del kept_u del_u
+  kept=$(jq '[ .[] | select(.action=="keep") ] | length' <<< "${GHCR_TAGS_CACHE:-[]}")
+  del=$(jq  '[ .[] | select(.action=="delete") ] | length' <<< "${GHCR_TAGS_CACHE:-[]}")
+  if (( INCLUDE_UNTAGGED )); then
+    kept_u=$(jq '[ .[] | select(.action=="keep") ] | length' <<< "${GHCR_UNTAGGED_CACHE:-[]}")
+    del_u=$(jq  '[ .[] | select(.action=="delete") ] | length' <<< "${GHCR_UNTAGGED_CACHE:-[]}")
+    log_info "GHCR summary: tags keep=$kept delete=$del; untagged keep=$kept_u delete=$del_u $([[ $DRY_RUN -eq 1 ]] && echo '(dry run)' || echo '')"
+  else
+    log_info "GHCR summary: keep=$kept delete=$del $([[ $DRY_RUN -eq 1 ]] && echo '(dry run)' || echo '')"
+  fi
+  echo
+  return 0
+}
+
+# ==============================================================
+# Docker Hub
+# ==============================================================
+DOCKER_TAGS_CACHE=""
+
+docker_login() {
+  local resp token
+  if ! resp=$(curl_retry_json -H "Content-Type: application/json" \
+                               -X POST https://hub.docker.com/v2/users/login \
+                               -d "{\"username\":\"${DOCKER_USER}\",\"password\":\"${DOCKER_PASS}\"}"); then
+    log_error "Docker Hub login request failed (network/HTTP error)"
+    return 1
+  fi
+  token=$(printf '%s' "$resp" | jq -r '.token // empty') || token=""
+  if [[ -z "$token" ]]; then
+    log_error "Docker Hub login returned no token"
+    return 1
+  fi
+  printf '%s' "$token"
+  return 0
+}
+
+docker_cache_tags() {
+  local token="$1" base_protected_json="$2" max_release="$3" max_dev="$4" protect_minor="$5" keep_release_count="$6" keep_dev_count="$7"
+
+  local url="https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags?page_size=100&ordering=last_updated"
+  local all_json='[]'
   while [[ -n "$url" && "$url" != "null" ]]; do
-    local resp; resp=$(curl -fsSL -H "Authorization: JWT ${token}" "$url")
+    local resp
+    if ! resp=$(curl_retry_json -H "Authorization: JWT ${token}" "$url"); then
+      log_error "Docker: fetch failed"
+      break
+    fi
     local results_len; results_len=$(echo "$resp" | jq '.results | length')
     [[ "$results_len" -gt 0 ]] || break
-
-    while IFS= read -r row; do
-      local tag last_updated epoch
-      tag=$(echo "$row" | jq -r '.name')
-      last_updated=$(echo "$row" | jq -r '.last_updated')
-      if is_release_tag "$tag"; then
-        epoch=$(iso_to_epoch "$last_updated")
-        if (( epoch > newest_epoch )); then
-          newest_epoch=$epoch; newest_tag="$tag"
-        fi
-      fi
-    done < <(echo "$resp" | jq -c '.results[]')
-
+    all_json=$(jq -s 'add' <(echo "$all_json") <(echo "$resp" | jq '.results'))
     url=$(echo "$resp" | jq -r '.next')
   done
+  log_debug "Docker fetched tags: $(echo "$all_json" | jq 'length')"
 
-  echo "$newest_tag"
+  local now; now=$(now_epoch)
+  local _tmp
+  if ! _tmp=$(
+    jq -c \
+      --argjson now "$now" \
+      --arg re "$RELEASE_RE" \
+      --argjson base_protected "$base_protected_json" \
+      --argjson max_release "$max_release" \
+      --argjson max_dev "$max_dev" \
+      --argjson protect_minor "$protect_minor" \
+      --argjson keep_release_count "$keep_release_count" \
+      --argjson keep_dev_count "$keep_dev_count" '
+      def stripv(t): t|sub("^v";"");
+      def parse(t):
+        (stripv(t) | capture("^(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<c>[0-9]+)(?:\\.(?<d>[0-9]+))?(?:-(?<suf>[A-Za-z0-9][A-Za-z0-9\\.-]*))?$"));
+      def rel_obj(name; age):
+        (parse(name) // empty) as $m
+        | {name: name, age_days: age,
+           maj: ($m.maj|tonumber), min: ($m.min|tonumber),
+           c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
+           suf: ($m.suf // ""), key: "\($m.maj).\($m.min)"};
+
+      [ .[] |
+        { name: .name,
+          last_updated: .last_updated,
+          age_days: (( $now - (.last_updated | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) ) / 86400 | floor),
+          type: (if (.name | test($re)) then "release" else "dev" end)
+        }
+      ] as $tags
+
+      | ( $tags | map(select(.type=="release") | rel_obj(.name; .age_days)) ) as $rel
+
+      | ( if ($rel|length)==0 then "" else
+            ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
+        end ) as $highest
+
+      | ( if $protect_minor==1 and ($rel|length)>0 then
+            ( $rel | sort_by(.key) | group_by(.key) | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+          else [] end
+        ) as $minor_heads
+
+      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $minor_heads | unique ) as $protected
+
+      | ( $tags | map(select(.type=="release" and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.name) ) as $force_keep_release
+      | ( $tags | map(select(.type=="dev"     and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.name) ) as $force_keep_dev
+
+      | $tags
+      | map(
+          .is_protected = ((.name as $n | $protected | index($n)) != null)
+        | .forced_keep  = ((.name as $n | ( ($force_keep_release + $force_keep_dev) // [] ) | index($n)) != null)
+        | .action = (if (.is_protected or .forced_keep) then "keep"
+                     elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
+                     elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
+                     else "keep" end)
+        | .type_out = (if .is_protected then "protected" else .type end)
+        | .order_bucket =
+            (if .is_protected and .name=="latest" then 0
+             elif .is_protected and (.name | test($re)) then 1
+             elif .is_protected then 2
+             elif .type=="release" and .action=="keep" then 3
+             elif .type=="release" and .action=="delete" then 4
+             elif .type=="dev" and .action=="keep" then 5
+             else 6 end)
+        | .sort_key =
+            (if .order_bucket==1 then
+               ( (parse(.name)) as $p
+                 | [($p.maj|tonumber),($p.min|tonumber),($p.c|tonumber),((($p.d // -1)|tonumber)),($p.suf // ""), (0 - .age_days)] )
+             elif .order_bucket==2 then [ .name ]
+             else [ .age_days ] end)
+        )
+      | sort_by([.order_bucket, .sort_key])
+      | map({action, type_out, age_days, name})
+    ' <<< "$all_json"
+  ); then
+    log_error "Docker: failed to process tags JSON"
+    DOCKER_TAGS_CACHE='[]'
+  else
+    DOCKER_TAGS_CACHE="$_tmp"
+  fi
+
+  if [[ -n "$OUT_DIR" ]]; then
+    mkdir -p "$OUT_DIR"
+    printf '%s\n' "${DOCKER_TAGS_CACHE:-[]}" | jq -S '.' > "$OUT_DIR/docker_tags_cache.json" || true
+    jq -r '.[] | [.action,.type_out,("\(.age_days)d"),.name] | @tsv' <<< "${DOCKER_TAGS_CACHE:-[]}" > "$OUT_DIR/docker_plan.tsv" || true
+  fi
+}
+
+docker_login_wrap_and_cache() {
+  local token=""
+  if ! token="$(docker_login)"; then
+    log_error "Docker Hub: login failed; continuing with empty set"
+    DOCKER_TAGS_CACHE='[]'
+  else
+    DOCKER_JWT="$token"
+    docker_cache_tags "$token" "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER_MINOR" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" || {
+      log_error "Docker Hub: caching failed; continuing with empty set"
+      DOCKER_TAGS_CACHE='[]'
+    }
+  fi
 }
 
 docker_cleanup() {
-  if (( DOCKER_ENABLED == 0 )); then
-    echo "==> Docker Hub: skipping (missing settings)"; echo; return
-  fi
+  (( DOCKER_ENABLED )) || { log_info "==> Docker Hub: skipping (missing settings)"; echo; return 0; }
+  log_info "==> Docker Hub: namespace=$DOCKER_NAMESPACE repo=$DOCKER_REPO"
 
-  echo "==> Docker Hub: namespace=$DOCKER_NAMESPACE repo=$DOCKER_REPO"
-  local token; token=$(docker_login) || die "Docker Hub login failed"
+  docker_login_wrap_and_cache
+  print_tag_rows "$DOCKER_TAGS_CACHE"
 
-  local PROTECTED_NEWEST_RELEASE_TAG
-  PROTECTED_NEWEST_RELEASE_TAG=$(docker_find_newest_release_tag "$token" || true)
-  if [[ -n "$PROTECTED_NEWEST_RELEASE_TAG" ]]; then
-    echo "Docker protected newest release-like tag: ${PROTECTED_NEWEST_RELEASE_TAG}"
-  else
-    echo "Docker: no release-like tags found to protect."
-  fi
-
-  local now; now=$(now_epoch)
-  local url="https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags?page_size=100&ordering=last_updated"
-  local deleted=0 considered=0 kept=0
-
-  while [[ -n "$url" && "$url" != "null" ]]; do
-    local resp; resp=$(curl -fsSL -H "Authorization: JWT ${token}" "$url")
-    local results_len; results_len=$(echo "$resp" | jq '.results | length')
-    [[ "$results_len" -eq 0 ]] && break
-
-    for row in $(echo "$resp" | jq -cr '.results[] | @base64'); do
-      _jq() { echo "$row" | base64 --decode | jq -r "$1"; }
-      local tag last_updated last_epoch age_days
-      tag=$(_jq '.name')
-      last_updated=$(_jq '.last_updated')
-      last_epoch=$(iso_to_epoch "$last_updated")
-      age_days=$(( (now - last_epoch) / 86400 ))
-
-      if contains_protected "$tag" || [[ -n "$PROTECTED_NEWEST_RELEASE_TAG" && "$tag" == "$PROTECTED_NEWEST_RELEASE_TAG" ]]; then
-        kept=$((kept+1))
-        echo "Docker keep (protected): $tag age=${age_days}d"
-        continue
-      fi
-
-      local is_release=0
-      if is_release_tag "$tag"; then is_release=1; fi
-      local threshold=$([[ $is_release -eq 1 ]] && echo "$MAX_RELEASE_DAYS" || echo "$MAX_DEV_DAYS")
-
-      considered=$((considered+1))
-      if (( age_days > threshold )); then
-        if (( DRY_RUN )); then
-          echo "Docker would DELETE: $tag age=${age_days}d (> ${threshold}d, $([[ $is_release -eq 1 ]] && echo release || echo dev))"
-        else
-          echo "Docker DELETE: $tag age=${age_days}d (> ${threshold}d, $([[ $is_release -eq 1 ]] && echo release || echo dev))"
-          curl -fsSL -X DELETE -H "Authorization: JWT ${token}" \
-            "https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags/${tag}/" >/dev/null
-          deleted=$((deleted+1))
-        fi
+  local pending; pending=$(jq '[ .[] | select(.action=="delete") ] | length' <<< "${DOCKER_TAGS_CACHE:-[]}")
+  if (( pending > 0 && DRY_RUN == 0 )); then
+    confirm_execute_once "$pending"
+    local remaining="$DELETE_LIMIT"
+    while IFS= read -r tag; do
+      [[ -z "${tag:-}" ]] && continue
+      if (( DELETE_LIMIT>0 && remaining==0 )); then break; fi
+      if curl_delete_with_retry "https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags/${tag}/" \
+           -H "Authorization: JWT ${DOCKER_JWT}"; then
+        (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
       else
-        kept=$((kept+1))
-        echo "Docker keep: $tag age=${age_days}d (<= ${threshold}d)"
+        log_error "  failed to delete Docker tag=$tag"; ANY_DELETE_FAILED=1
       fi
-    done
+    done < <(jq -r '.[] | select(.action=="delete") | .name' <<< "${DOCKER_TAGS_CACHE:-[]}" || true)
+  fi
 
-    url=$(echo "$resp" | jq -r '.next')
-  done
-
-  echo "Docker summary: considered=$considered kept=$kept deleted=$deleted (final deletions only with --execute)"
+  local kept del
+  kept=$(jq '[ .[] | select(.action=="keep") ] | length' <<< "${DOCKER_TAGS_CACHE:-[]}")
+  del=$(jq  '[ .[] | select(.action=="delete") ] | length' <<< "${DOCKER_TAGS_CACHE:-[]}")
+  log_info "Docker summary: keep=$kept delete=$del $([[ $DRY_RUN -eq 1 ]] && echo '(dry run)' || echo '')"
   echo
 }
 
 # --- run -------------------------------------------------------
 ghcr_cleanup
 docker_cleanup
-
-echo "All done."
+log_info "All done."
