@@ -28,7 +28,6 @@ On macOS, install GNU coreutils: `brew install coreutils`
 ./registry-prune.sh \
   --ghcr-owner-type users \
   --ghcr-owner myusername \
-  --ghcr-user myusername \
   --ghcr-token ghp_xxxxxxxxxxxx \
   --ghcr-package mypackage \
   --max-release-days 90 \
@@ -51,7 +50,6 @@ On macOS, install GNU coreutils: `brew install coreutils`
 ./registry-prune.sh \
   --ghcr-owner-type users \
   --ghcr-owner myusername \
-  --ghcr-user myusername \
   --ghcr-token ghp_xxxxxxxxxxxx \
   --ghcr-package mypackage \
   --docker-user myusername \
@@ -70,7 +68,6 @@ On macOS, install GNU coreutils: `brew install coreutils`
 #### GitHub Container Registry (GHCR)
 - `--ghcr-owner-type users|orgs` - Owner type (users or organizations)
 - `--ghcr-owner OWNER` - GitHub username or organization name
-- `--ghcr-user USER` - GitHub username for authentication
 - `--ghcr-token TOKEN` - GitHub Personal Access Token with package permissions
 - `--ghcr-package PACKAGE` - Package name in GHCR
 
@@ -138,7 +135,6 @@ The script automatically protects:
 ./registry-prune.sh \
   --ghcr-owner-type users \
   --ghcr-owner johndoe \
-  --ghcr-user johndoe \
   --ghcr-token ghp_xxxxxxxxxxxx \
   --ghcr-package myapp \
   --max-release-days 180 \
@@ -165,7 +161,6 @@ The script automatically protects:
 ./registry-prune.sh \
   --ghcr-owner-type orgs \
   --ghcr-owner myorg \
-  --ghcr-user johndoe \
   --ghcr-token ghp_xxxxxxxxxxxx \
   --ghcr-package myapp \
   --max-release-days 90 \
@@ -180,7 +175,6 @@ The script automatically protects:
 ./registry-prune.sh \
   --ghcr-owner-type users \
   --ghcr-owner johndoe \
-  --ghcr-user johndoe \
   --ghcr-token ghp_xxxxxxxxxxxx \
   --ghcr-package myapp \
   --max-release-days 365 \

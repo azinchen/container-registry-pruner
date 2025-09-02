@@ -43,7 +43,6 @@ MAX_UNTAGGED_DAYS=""
 # --- GHCR (optional) -----------------------------------------
 GHCR_OWNER_TYPE="users"    # "users" or "orgs"
 GHCR_OWNER=""
-GHCR_USER=""
 GHCR_TOKEN=""
 GHCR_PACKAGE=""
 
@@ -106,7 +105,7 @@ usage() {
   cat <<EOF
 Usage:
   $(basename "$0")
-    [--ghcr-owner-type users|orgs] [--ghcr-owner OWNER] [--ghcr-user USER] [--ghcr-token TOKEN] [--ghcr-package PACKAGE]
+    [--ghcr-owner-type users|orgs] [--ghcr-owner OWNER] [--ghcr-token TOKEN] [--ghcr-package PACKAGE]
     [--docker-user USER] [--docker-pass PASS] [--docker-namespace NS] [--docker-repo REPO]
     [--max-release-days N] [--max-dev-days M]
     [--keep-release-count N] [--keep-dev-count M]
@@ -123,7 +122,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --ghcr-owner-type) GHCR_OWNER_TYPE="$2"; shift 2;;
     --ghcr-owner) GHCR_OWNER="$2"; shift 2;;
-    --ghcr-user) GHCR_USER="$2"; shift 2;;
     --ghcr-token) GHCR_TOKEN="$2"; shift 2;;
     --ghcr-package) GHCR_PACKAGE="$2"; shift 2;;
 
