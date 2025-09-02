@@ -138,10 +138,8 @@ while [[ $# -gt 0 ]]; do
     --keep-release-count) KEEP_RELEASE_COUNT="$2"; shift 2;;
     --keep-dev-count)     KEEP_DEV_COUNT="$2"; shift 2;;
 
-    # Configurable protect scope
     --protect-latest-per)
       PROTECT_LATEST_PER=1
-      # if value provided and not another flag -> use it; else default to patch
       if [[ $# -ge 2 && ! "${2:-}" =~ ^-- ]]; then
         PROTECT_SCOPE="$2"
         [[ "$PROTECT_SCOPE" =~ ^(minor|patch)$ ]] || die "--protect-latest-per must be 'minor' or 'patch'"
@@ -320,6 +318,10 @@ ghcr_cache_versions() {
            maj: ($m.maj|tonumber), min: ($m.min|tonumber),
            c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
            suf: ($m.suf // ""), key_minor: "\($m.maj).\($m.min)", key_patch: "\($m.maj).\($m.min).\($m.c)"};
+      def vkey(t):
+        (parse(t) as $m
+         | if $m then [($m.maj|tonumber),($m.min|tonumber),($m.c|tonumber),((($m.d // -1)|tonumber)),($m.suf // "")]
+           else null end);
 
       [ .[] | select((.tags|length)>0) | . as $v | ($v.tags[] | {tag: ., age_days: $v.age_days}) ]
       | sort_by(.tag) | group_by(.tag)
@@ -354,22 +356,34 @@ ghcr_cache_versions() {
                      elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
                      else "keep" end)
         | .type_out = (if .is_protected then "protected" else .type end)
-        | .order_bucket =
-            (if .is_protected and .tag=="latest" then 0
-             elif .is_protected and (.tag | test($re)) then 1
-             elif .is_protected then 2
-             elif .type=="release" and .action=="keep" then 3
-             elif .type=="release" and .action=="delete" then 4
-             elif .type=="dev" and .action=="keep" then 5
-             else 6 end)
-        | .sort_key =
-            (if .order_bucket==1 then
-               ( (parse(.tag)) as $p
-                 | [($p.maj|tonumber),($p.min|tonumber),($p.c|tonumber),((($p.d // -1)|tonumber)),($p.suf // ""), (0 - .age_days)] )
-             elif .order_bucket==2 then [ .tag ]
-             else [ .age_days ] end)
+      ) as $full
+
+      # --------- Final ordering (sections) ----------
+      | (
+          # KEEP protected: latest first, then release-like by version, then others by name
+          ( [ $full[] | select(.action=="keep" and .is_protected and .tag=="latest") ] +
+            ( [ $full[] | select(.action=="keep" and .is_protected and .tag!="latest" and (.tag|test($re))) ]
+              | sort_by( vkey(.tag) ) | reverse ) +
+            ( [ $full[] | select(.action=="keep" and .is_protected and .tag!="latest" and ((.tag|test($re)) == false)) ]
+              | sort_by(.tag) )
+          ) +
+
+          # KEEP release (non-protected), version-desc
+          ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="release") ]
+            | sort_by( vkey(.tag) ) | reverse ) +
+
+          # KEEP dev (non-protected), name asc
+          ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="dev") ]
+            | sort_by(.tag) ) +
+
+          # DELETE release, version-desc
+          ( [ $full[] | select(.action=="delete" and .type=="release") ]
+            | sort_by( vkey(.tag) ) | reverse ) +
+
+          # DELETE dev, name asc
+          ( [ $full[] | select(.action=="delete" and .type=="dev") ]
+            | sort_by(.tag) )
         )
-      | sort_by([.order_bucket, .sort_key])
       | map({action, type_out, age_days, tag})
     ' <<< "$GHCR_VERSIONS_CACHE"
   ); then
@@ -543,6 +557,10 @@ docker_cache_tags() {
            maj: ($m.maj|tonumber), min: ($m.min|tonumber),
            c: ($m.c|tonumber), d: (($m.d // -1)|tonumber),
            suf: ($m.suf // ""), key_minor: "\($m.maj).\($m.min)", key_patch: "\($m.maj).\($m.min).\($m.c)"};
+      def vkey(t):
+        (parse(t) as $m
+         | if $m then [($m.maj|tonumber),($m.min|tonumber),($m.c|tonumber),((($m.d // -1)|tonumber)),($m.suf // "")]
+           else null end);
 
       [ .[] |
         { name: .name,
@@ -580,22 +598,34 @@ docker_cache_tags() {
                      elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
                      else "keep" end)
         | .type_out = (if .is_protected then "protected" else .type end)
-        | .order_bucket =
-            (if .is_protected and .name=="latest" then 0
-             elif .is_protected and (.name | test($re)) then 1
-             elif .is_protected then 2
-             elif .type=="release" and .action=="keep" then 3
-             elif .type=="release" and .action=="delete" then 4
-             elif .type=="dev" and .action=="keep" then 5
-             else 6 end)
-        | .sort_key =
-            (if .order_bucket==1 then
-               ( (parse(.name)) as $p
-                 | [($p.maj|tonumber),($p.min|tonumber),($p.c|tonumber),((($p.d // -1)|tonumber)),($p.suf // ""), (0 - .age_days)] )
-             elif .order_bucket==2 then [ .name ]
-             else [ .age_days ] end)
+      ) as $full
+
+      # --------- Final ordering (sections) ----------
+      | (
+          # KEEP protected: latest first, then release-like by version, then others by name
+          ( [ $full[] | select(.action=="keep" and .is_protected and .name=="latest") ] +
+            ( [ $full[] | select(.action=="keep" and .is_protected and .name!="latest" and (.name|test($re))) ]
+              | sort_by( vkey(.name) ) | reverse ) +
+            ( [ $full[] | select(.action=="keep" and .is_protected and .name!="latest" and ((.name|test($re)) == false)) ]
+              | sort_by(.name) )
+          ) +
+
+          # KEEP release (non-protected), version-desc
+          ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="release") ]
+            | sort_by( vkey(.name) ) | reverse ) +
+
+          # KEEP dev (non-protected), name asc
+          ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="dev") ]
+            | sort_by(.name) ) +
+
+          # DELETE release, version-desc
+          ( [ $full[] | select(.action=="delete" and .type=="release") ]
+            | sort_by( vkey(.name) ) | reverse ) +
+
+          # DELETE dev, name asc
+          ( [ $full[] | select(.action=="delete" and .type=="dev") ]
+            | sort_by(.name) )
         )
-      | sort_by([.order_bucket, .sort_key])
       | map({action, type_out, age_days, name})
     ' <<< "$all_json"
   ); then
