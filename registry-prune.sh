@@ -372,17 +372,17 @@ ghcr_cache_versions() {
           ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="release") ]
             | sort_by( vkey(.tag) ) | reverse ) +
 
-          # KEEP dev (non-protected), name asc
+          # KEEP dev (non-protected), newest→oldest by age
           ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="dev") ]
-            | sort_by(.tag) ) +
+            | sort_by(.age_days) ) +
 
           # DELETE release, version-desc
           ( [ $full[] | select(.action=="delete" and .type=="release") ]
             | sort_by( vkey(.tag) ) | reverse ) +
 
-          # DELETE dev, name asc
+          # DELETE dev, newest→oldest by age
           ( [ $full[] | select(.action=="delete" and .type=="dev") ]
-            | sort_by(.tag) )
+            | sort_by(.age_days) )
         )
       | map({action, type_out, age_days, tag})
     ' <<< "$GHCR_VERSIONS_CACHE"
@@ -614,17 +614,17 @@ docker_cache_tags() {
           ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="release") ]
             | sort_by( vkey(.name) ) | reverse ) +
 
-          # KEEP dev (non-protected), name asc
+          # KEEP dev (non-protected), newest→oldest by age
           ( [ $full[] | select(.action=="keep" and (.is_protected|not) and .type=="dev") ]
-            | sort_by(.name) ) +
+            | sort_by(.age_days) ) +
 
           # DELETE release, version-desc
           ( [ $full[] | select(.action=="delete" and .type=="release") ]
             | sort_by( vkey(.name) ) | reverse ) +
 
-          # DELETE dev, name asc
+          # DELETE dev, newest→oldest by age
           ( [ $full[] | select(.action=="delete" and .type=="dev") ]
-            | sort_by(.name) )
+            | sort_by(.age_days) )
         )
       | map({action, type_out, age_days, name})
     ' <<< "$all_json"
