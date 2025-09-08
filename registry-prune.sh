@@ -29,6 +29,7 @@ DELETE_LIMIT=0
 OUT_DIR=""
 QUIET=0
 VERBOSE=0
+DELETE_SPECIFIC_TAGS=()
 
 # Protection policies
 PROTECT_LATEST_PER=0         # 0/1
@@ -112,6 +113,7 @@ Usage:
     [--protect-latest-per <minor|patch>]      # default 'patch' if provided without value
     [--protect TAG]... [--output-dir DIR]
     [--include-untagged] [--max-untagged-days K]   # GHCR only
+    [--delete-specific-tag TAG]...            # delete specific tags (can be used multiple times)
     [--execute] [--yes] [--delete-limit N]
     [--quiet] [--verbose]
 EOF
@@ -154,6 +156,8 @@ while [[ $# -gt 0 ]]; do
     --include-untagged) INCLUDE_UNTAGGED=1; shift;;
     --max-untagged-days) MAX_UNTAGGED_DAYS="$2"; shift 2;;
 
+    --delete-specific-tag) DELETE_SPECIFIC_TAGS+=("$2"); shift 2;;
+
     --execute) DRY_RUN=0; shift;;
     --yes) ASSUME_YES=1; shift;;
     --delete-limit) DELETE_LIMIT="$2"; shift 2;;
@@ -193,15 +197,34 @@ if (( GHCR_ENABLED == 0 && DOCKER_ENABLED == 0 )); then
   exit 0
 fi
 
-# Thresholds required when something will run
-if [[ -z "$MAX_RELEASE_DAYS" || -z "$MAX_DEV_DAYS" ]]; then
-  die "--max-release-days and --max-dev-days are required when a registry is configured"
+# Handle specific tag deletion mode
+if [[ ${#DELETE_SPECIFIC_TAGS[@]} -gt 0 ]]; then
+  for tag in "${DELETE_SPECIFIC_TAGS[@]}"; do
+    if [[ "$tag" == "latest" ]]; then
+      die "Cannot delete 'latest' tag using --delete-specific-tag"
+    fi
+  done
+  # Don't force execution mode - let user see tags in DRY_RUN first
+  log_info "Specific tag deletion mode: targeting [${DELETE_SPECIFIC_TAGS[*]}]"
+  echo
 fi
-if (( INCLUDE_UNTAGGED )) && (( GHCR_ENABLED )); then
-  [[ -n "$MAX_UNTAGGED_DAYS" ]] || die "--max-untagged-days is required when --include-untagged is used for GHCR"
-fi
-if (( INCLUDE_UNTAGGED )) && (( DOCKER_ENABLED )); then
-  log_info "Docker Hub: --include-untagged has no effect (API doesn't list them)."
+
+# Thresholds required when something will run (unless deleting specific tag)
+if [[ ${#DELETE_SPECIFIC_TAGS[@]} -eq 0 ]]; then
+  if [[ -z "$MAX_RELEASE_DAYS" || -z "$MAX_DEV_DAYS" ]]; then
+    die "--max-release-days and --max-dev-days are required when a registry is configured"
+  fi
+  if (( INCLUDE_UNTAGGED )) && (( GHCR_ENABLED )); then
+    [[ -n "$MAX_UNTAGGED_DAYS" ]] || die "--max-untagged-days is required when --include-untagged is used for GHCR"
+  fi
+  if (( INCLUDE_UNTAGGED )) && (( DOCKER_ENABLED )); then
+    log_info "Docker Hub: --include-untagged has no effect (API doesn't list them)."
+  fi
+else
+  # Set defaults for specific tag deletion mode
+  MAX_RELEASE_DAYS=${MAX_RELEASE_DAYS:-0}
+  MAX_DEV_DAYS=${MAX_DEV_DAYS:-0}
+  MAX_UNTAGGED_DAYS=${MAX_UNTAGGED_DAYS:-0}
 fi
 
 # Default protect scope if feature enabled but unset
@@ -262,6 +285,8 @@ GHCR_UNTAGGED_CACHE=""
 
 ghcr_cache_versions() {
   local base_protected_json="$1" max_release="$2" max_dev="$3" protect_flag="$4" protect_scope="$5" keep_release_count="$6" keep_dev_count="$7" include_untagged="$8" max_untagged="$9"
+  shift 9
+  local specific_tags=("$@")
 
   local page=1 all_json='[]'
   while :; do
@@ -281,6 +306,7 @@ ghcr_cache_versions() {
   log_debug "GHCR fetched versions: $(echo "$all_json" | jq 'length')"
   local now; now=$(now_epoch)
 
+  # First, process raw API response into standardized format
   local _tmp
   if ! _tmp=$(
     jq -c --argjson now "$now" --arg re "$RELEASE_RE" --argjson incl "$include_untagged" '
@@ -297,6 +323,9 @@ ghcr_cache_versions() {
     GHCR_VERSIONS_CACHE="$_tmp"
   fi
 
+  # Then, process into per-tag decisions
+  local specific_tags_json
+  specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
   if ! _tmp=$(
     jq -c \
       --arg re "$RELEASE_RE" \
@@ -306,7 +335,8 @@ ghcr_cache_versions() {
       --argjson protect_flag "$protect_flag" \
       --arg protect_scope "$protect_scope" \
       --argjson keep_release_count "$keep_release_count" \
-      --argjson keep_dev_count "$keep_dev_count" '
+      --argjson keep_dev_count "$keep_dev_count" \
+      --argjson specific_tags "$specific_tags_json" '
       def stripv(t): t|sub("^v";"");
       def parse(t):
         (stripv(t) | capture("^(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<c>[0-9]+)(?:\\.(?<d>[0-9]+))?(?:-(?<suf>[A-Za-z0-9][A-Za-z0-9\\.-]*))?$"));
@@ -326,35 +356,53 @@ ghcr_cache_versions() {
       | map({ tag: (.[0].tag), age_days: (map(.age_days) | min),
               type: (if (.[0].tag | test($re)) then "release" else "dev" end) }) as $tags
 
-      | ( $tags | map(select(.type=="release") | rel_obj(.tag; .age_days)) ) as $rel
+      | ( if ($specific_tags | length > 0) then
+          # Specific tag deletion mode - only process the specified tags
+          $tags | map(
+            if (.tag as $t | $specific_tags | index($t)) != null then
+              .is_protected = false
+              | .forced_keep = false
+              | .action = "delete"
+              | .type_out = .type
+            else
+              .is_protected = true
+              | .forced_keep = false
+              | .action = "keep"
+              | .type_out = "protected"
+            end
+          )
+        else
+          # Normal mode - existing logic
+          ( $tags | map(select(.type=="release") | rel_obj(.tag; .age_days)) ) as $rel
 
-      | ( if ($rel|length)==0 then "" else
-            ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
-        end ) as $highest
+          | ( if ($rel|length)==0 then "" else
+                ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
+            end ) as $highest
 
-      | ( if ($protect_flag==1 and ($rel|length)>0) then
-            ( $rel
-              | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
-              | sort_by(.group) | group_by(.group)
-              | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
-          else [] end
-        ) as $scope_heads
+          | ( if ($protect_flag==1 and ($rel|length)>0) then
+                ( $rel
+                  | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
+                  | sort_by(.group) | group_by(.group)
+                  | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+              else [] end
+            ) as $scope_heads
 
-      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
+          | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
 
-      | ( $tags | map(select(.type=="release" and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.tag) ) as $force_keep_release
-      | ( $tags | map(select(.type=="dev"     and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.tag) ) as $force_keep_dev
+          | ( $tags | map(select(.type=="release" and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.tag) ) as $force_keep_release
+          | ( $tags | map(select(.type=="dev"     and ((.tag as $t | $protected | index($t)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.tag) ) as $force_keep_dev
 
-      | $tags
-      | map(
-          .is_protected = ((.tag as $t | $protected | index($t)) != null)
-        | .forced_keep  = ((.tag as $t | ( ($force_keep_release + $force_keep_dev) // [] ) | index($t)) != null)
-        | .action = (if (.is_protected or .forced_keep) then "keep"
-                     elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
-                     elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
-                     else "keep" end)
-        | .type_out = (if .is_protected then "protected" else .type end)
-      ) as $full
+          | $tags
+          | map(
+              .is_protected = ((.tag as $t | $protected | index($t)) != null)
+            | .forced_keep  = ((.tag as $t | ( ($force_keep_release + $force_keep_dev) // [] ) | index($t)) != null)
+            | .action = (if (.is_protected or .forced_keep) then "keep"
+                         elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
+                         elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
+                         else "keep" end)
+            | .type_out = (if .is_protected then "protected" else .type end)
+          )
+        end ) as $full
 
       # --------- Final ordering (sections) ----------
       | (
@@ -437,7 +485,7 @@ ghcr_cleanup() {
   (( GHCR_ENABLED )) || { log_info "==> GHCR: skipping (missing settings)"; echo; return 0; }
   log_info "==> GHCR: owner_type=$GHCR_OWNER_TYPE owner=$GHCR_OWNER package=$GHCR_PACKAGE"
 
-  if ! ghcr_cache_versions "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "$INCLUDE_UNTAGGED" "${MAX_UNTAGGED_DAYS:-0}"; then
+  if ! ghcr_cache_versions "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "$INCLUDE_UNTAGGED" "${MAX_UNTAGGED_DAYS:-0}" "${DELETE_SPECIFIC_TAGS[@]}"; then
     log_error "GHCR: caching failed; continuing with empty sets"
     GHCR_TAGS_CACHE='[]'; GHCR_UNTAGGED_CACHE='[]'
   fi
@@ -451,6 +499,9 @@ ghcr_cleanup() {
 
   if (( total > 0 && DRY_RUN == 0 )); then
     confirm_execute_once "$total"
+    if [[ ${#DELETE_SPECIFIC_TAGS[@]} -gt 0 ]]; then
+      log_info "Deleting specific tags [${DELETE_SPECIFIC_TAGS[*]}] from GHCR..."
+    fi
     local remaining="$DELETE_LIMIT"
 
     while IFS= read -r tag; do
@@ -461,7 +512,11 @@ ghcr_cleanup() {
              -H "Accept: application/vnd.github+json" \
              -H "Authorization: Bearer ${GHCR_TOKEN}" \
              -H "X-GitHub-Api-Version: 2022-11-28"
-        then (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
+        then 
+          (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
+          if [[ ${#DELETE_SPECIFIC_TAGS[@]} -gt 0 ]]; then
+            log_info "Successfully deleted GHCR tag: $tag"
+          fi
         else log_error "  failed to delete GHCR version_id=$vid (tag=$tag)"; ANY_DELETE_FAILED=1; fi
       done < <(jq -r --arg t "$tag" '.[] | select(any(.tags[]?; . == $t)) | .id' <<< "${GHCR_VERSIONS_CACHE:-[]}" || true)
     done < <(jq -r '.[] | select(.action=="delete") | .tag' <<< "${GHCR_TAGS_CACHE:-[]}" || true)
@@ -517,6 +572,8 @@ docker_login() {
 
 docker_cache_tags() {
   local token="$1" base_protected_json="$2" max_release="$3" max_dev="$4" protect_flag="$5" protect_scope="$6" keep_release_count="$7" keep_dev_count="$8"
+  shift 8
+  local specific_tags=("$@")
 
   local url="https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags?page_size=100&ordering=last_updated"
   local all_json='[]'
@@ -534,6 +591,8 @@ docker_cache_tags() {
   log_debug "Docker fetched tags: $(echo "$all_json" | jq 'length')"
 
   local now; now=$(now_epoch)
+  local specific_tags_json
+  specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
   local _tmp
   if ! _tmp=$(
     jq -c \
@@ -545,7 +604,8 @@ docker_cache_tags() {
       --argjson protect_flag "$protect_flag" \
       --arg protect_scope "$protect_scope" \
       --argjson keep_release_count "$keep_release_count" \
-      --argjson keep_dev_count "$keep_dev_count" '
+      --argjson keep_dev_count "$keep_dev_count" \
+      --argjson specific_tags "$specific_tags_json" '
       def stripv(t): t|sub("^v";"");
       def parse(t):
         (stripv(t) | capture("^(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<c>[0-9]+)(?:\\.(?<d>[0-9]+))?(?:-(?<suf>[A-Za-z0-9][A-Za-z0-9\\.-]*))?$"));
@@ -568,35 +628,53 @@ docker_cache_tags() {
         }
       ] as $tags
 
-      | ( $tags | map(select(.type=="release") | rel_obj(.name; .age_days)) ) as $rel
+      | ( if ($specific_tags | length > 0) then
+          # Specific tag deletion mode - only process the specified tags
+          $tags | map(
+            if (.name as $n | $specific_tags | index($n)) != null then
+              .is_protected = false
+              | .forced_keep = false
+              | .action = "delete"
+              | .type_out = .type
+            else
+              .is_protected = true
+              | .forced_keep = false
+              | .action = "keep"
+              | .type_out = "protected"
+            end
+          )
+        else
+          # Normal mode - existing logic
+          ( $tags | map(select(.type=="release") | rel_obj(.name; .age_days)) ) as $rel
 
-      | ( if ($rel|length)==0 then "" else
-            ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
-        end ) as $highest
+          | ( if ($rel|length)==0 then "" else
+                ( $rel | sort_by([.maj,.min,.c,.d,.suf,(0-.age_days)]) | last | .name )
+            end ) as $highest
 
-      | ( if ($protect_flag==1 and ($rel|length)>0) then
-            ( $rel
-              | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
-              | sort_by(.group) | group_by(.group)
-              | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
-          else [] end
-        ) as $scope_heads
+          | ( if ($protect_flag==1 and ($rel|length)>0) then
+                ( $rel
+                  | map(.group = (if $protect_scope=="minor" then .key_minor else .key_patch end))
+                  | sort_by(.group) | group_by(.group)
+                  | map( sort_by([.c,.d,.suf,(0-.age_days)]) | last | .name ) )
+              else [] end
+            ) as $scope_heads
 
-      | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
+          | ( $base_protected + (if $highest=="" then [] else [$highest] end) + $scope_heads | unique ) as $protected
 
-      | ( $tags | map(select(.type=="release" and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.name) ) as $force_keep_release
-      | ( $tags | map(select(.type=="dev"     and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.name) ) as $force_keep_dev
+          | ( $tags | map(select(.type=="release" and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_release_count)] // [] ) | map(.name) ) as $force_keep_release
+          | ( $tags | map(select(.type=="dev"     and ((.name as $n | $protected | index($n)) == null))) | sort_by(.age_days) | ( .[0: ($keep_dev_count    )] // [] ) | map(.name) ) as $force_keep_dev
 
-      | $tags
-      | map(
-          .is_protected = ((.name as $n | $protected | index($n)) != null)
-        | .forced_keep  = ((.name as $n | ( ($force_keep_release + $force_keep_dev) // [] ) | index($n)) != null)
-        | .action = (if (.is_protected or .forced_keep) then "keep"
-                     elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
-                     elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
-                     else "keep" end)
-        | .type_out = (if .is_protected then "protected" else .type end)
-      ) as $full
+          | $tags
+          | map(
+              .is_protected = ((.name as $n | $protected | index($n)) != null)
+            | .forced_keep  = ((.name as $n | ( ($force_keep_release + $force_keep_dev) // [] ) | index($n)) != null)
+            | .action = (if (.is_protected or .forced_keep) then "keep"
+                         elif (.type=="release") then (if .age_days <= $max_release then "keep" else "delete" end)
+                         elif (.type=="dev")     then (if .age_days <= $max_dev    then "keep" else "delete" end)
+                         else "keep" end)
+            | .type_out = (if .is_protected then "protected" else .type end)
+          )
+        end ) as $full
 
       # --------- Final ordering (sections) ----------
       | (
@@ -647,7 +725,7 @@ docker_login_wrap_and_cache() {
     DOCKER_TAGS_CACHE='[]'
   else
     DOCKER_JWT="$token"
-    docker_cache_tags "$token" "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" || {
+    docker_cache_tags "$token" "$JQ_PROTECTED" "$MAX_RELEASE_DAYS" "$MAX_DEV_DAYS" "$PROTECT_LATEST_PER" "$PROTECT_SCOPE" "$KEEP_RELEASE_COUNT" "$KEEP_DEV_COUNT" "${DELETE_SPECIFIC_TAGS[@]}" || {
       log_error "Docker Hub: caching failed; continuing with empty set"
       DOCKER_TAGS_CACHE='[]'
     }
@@ -664,6 +742,9 @@ docker_cleanup() {
   local pending; pending=$(jq '[ .[] | select(.action=="delete") ] | length' <<< "${DOCKER_TAGS_CACHE:-[]}")
   if (( pending > 0 && DRY_RUN == 0 )); then
     confirm_execute_once "$pending"
+    if [[ ${#DELETE_SPECIFIC_TAGS[@]} -gt 0 ]]; then
+      log_info "Deleting specific tags [${DELETE_SPECIFIC_TAGS[*]}] from Docker Hub..."
+    fi
     local remaining="$DELETE_LIMIT"
     while IFS= read -r tag; do
       [[ -z "${tag:-}" ]] && continue
@@ -671,6 +752,9 @@ docker_cleanup() {
       if curl_delete_with_retry "https://hub.docker.com/v2/repositories/${DOCKER_NAMESPACE}/${DOCKER_REPO}/tags/${tag}/" \
            -H "Authorization: JWT ${DOCKER_JWT}"; then
         (( DELETE_LIMIT>0 )) && remaining=$((remaining-1))
+        if [[ ${#DELETE_SPECIFIC_TAGS[@]} -gt 0 ]]; then
+          log_info "Successfully deleted Docker Hub tag: $tag"
+        fi
       else
         log_error "  failed to delete Docker tag=$tag"; ANY_DELETE_FAILED=1
       fi
