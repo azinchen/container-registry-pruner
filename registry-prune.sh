@@ -325,7 +325,11 @@ ghcr_cache_versions() {
 
   # Then, process into per-tag decisions
   local specific_tags_json
-  specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
+  if [[ ${#specific_tags[@]} -eq 0 ]]; then
+    specific_tags_json='[]'
+  else
+    specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
+  fi
   if ! _tmp=$(
     jq -c \
       --arg re "$RELEASE_RE" \
@@ -592,7 +596,11 @@ docker_cache_tags() {
 
   local now; now=$(now_epoch)
   local specific_tags_json
-  specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
+  if [[ ${#specific_tags[@]} -eq 0 ]]; then
+    specific_tags_json='[]'
+  else
+    specific_tags_json=$(printf '%s\n' "${specific_tags[@]}" | jq -R . | jq -cs '.')
+  fi
   local _tmp
   if ! _tmp=$(
     jq -c \
